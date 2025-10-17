@@ -791,5 +791,30 @@ class DevControllerApp(tk.Tk):
         except Exception:
             return str(obj)
 
+# snippet to integrate in your GUI's startup
+import asyncio, json, websockets, threading
+
+class UiBridge:
+    def __init__(self, on_update, on_ping):
+        self.on_update = on_update
+        self.on_ping = on_ping
+
+    async def run(self):
+        async with websockets.connect("ws://localhost:8766/ui") as ws:
+            async for msg in ws:
+                obj = json.loads(msg)
+                if obj.get("type") == "ui_update":
+                    self.on_update(
+                        battery_v = obj.get("battery_v"),
+                        hb_age_ms = obj.get("heartbeat_age_ms"),
+                        active    = obj.get("active_opmode"),
+                        seq       = obj.get("seq"),
+                    )
+                elif obj.get("type") == "ping":
+                    self.on_ping(rtt_ms = obj.get("rtt_ms"))
+
+def start_ui_bridge(on_update, on_ping):
+    loop = asyncio.new_event_loop()
+    threading.Thread(target=loop.run_until_complete, args=(UiBridge(on_update, on_ping).run(),), daemon=True).start()
 
 __all__ = ["DevControllerApp"]
