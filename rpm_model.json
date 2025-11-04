@@ -1,0 +1,8 @@
+{
+  "model": "linear_ft",
+  "m_rpm_per_ft": 116.4042383594456,
+  "b_rpm_offset": 2084.2966941424975,
+  "v_nom": 12.0,
+  "gamma": 1.0,
+  "delta_bins": []
+}
