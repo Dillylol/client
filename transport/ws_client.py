@@ -60,7 +60,11 @@ class WSClient:
                         "endpoint": url,
                     }
                 )
-                async with websockets.connect(url, extra_headers=headers, ping_interval=None) as ws:
+                async with websockets.connect(
+                    url,
+                    additional_headers=headers or None,
+                    ping_interval=None,
+                ) as ws:
                     self._current_ws = ws
                     self._connected.set()
                     self._emit_status(
