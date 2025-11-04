@@ -1,8 +1,14 @@
 {
-  "model": "linear_ft",
-  "m_rpm_per_ft": 116.4042383594456,
-  "b_rpm_offset": 2084.2966941424975,
+  "schema": "rpm_model/v1",
+  "model_version": 1,
+  "model": "quadratic",
+  "params": {
+    "b0": 1950.0,
+    "b1": 22.0,
+    "b2": 0.45
+  },
   "v_nom": 12.0,
   "gamma": 1.0,
-  "delta_bins": []
+  "delta_bins": [],
+  "note": "seed"
 }
