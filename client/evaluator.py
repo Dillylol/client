@@ -2,12 +2,13 @@
 from __future__ import annotations
 
 import csv
+import logging
 import math
 import uuid
-from collections import Counter, deque
+from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Deque, Dict, Iterable, Optional, Tuple
+from typing import Any, Deque, Dict, Iterable, Optional, Tuple
 
 from .config import ClientConfig
 from .rpm_model import RpmModel
@@ -40,10 +41,16 @@ class PendingCommand:
     shot_id: str
     distance_in: float
     voltage: float
+    rpm_base: float
+    rpm_bias: int
     rpm_target: float
+    range_delta_in: int
     sent_ts_ms: int
     expires_ts_ms: int
     request_seq: int
+    rpm_tgt_cmd: Optional[float] = None
+    rpm_at_fire: Optional[float] = None
+    metadata: Dict[str, Any] | None = None
 
 
 class ShotEvaluator:
@@ -61,15 +68,26 @@ class ShotEvaluator:
         self._pending_by_shot: Dict[str, PendingCommand] = {}
         self._processed_shots: set[str] = set()
         self._band_stats: Dict[Tuple[float, float], BandStats] = {}
-        self._band_bias_steps: Counter = Counter()
+        self._band_bias_adjust: Dict[Tuple[float, float], int] = {}
         self._band_residual_sign: Dict[Tuple[float, float], int] = {}
-        self._pending_step: Counter = Counter()
+        self._pending_step: Dict[Tuple[float, float], float] = {}
         self._last_outcome: Dict[Tuple[float, float], str] = {}
         self._residual_history: Deque[float] = deque(maxlen=200)
         self._shots_since_update = 0
         self._total_shots = 0
         self._last_update_shot_index = 0
         self._last_update_rmse = math.inf
+
+        self._anchor_band: Optional[Tuple[float, float]] = (
+            tuple(self.config.distance_bins[0]) if self.config.distance_bins else None
+        )
+        if not self.config.policy.start_with_anchor:
+            self._anchor_band = None
+        self._anchor_completed = not self.config.policy.start_with_anchor
+        self._anchor_shots = 0
+        self._anchor_first_command_sent = False
+
+        self._logger = logging.getLogger(__name__)
 
         self._shots_log_path = self.config.paths.logs_dir / "shots.csv"
         if not self._shots_log_path.exists():
@@ -84,7 +102,7 @@ class ShotEvaluator:
         self._pending_commands.clear()
         self._pending_by_shot.clear()
         self._processed_shots.clear()
-        self._band_bias_steps.clear()
+        self._band_bias_adjust.clear()
         self._band_residual_sign.clear()
         self._pending_step.clear()
         self._last_outcome.clear()
@@ -94,6 +112,15 @@ class ShotEvaluator:
         self._last_update_shot_index = 0
         self._last_update_rmse = math.inf
         self._band_stats = {tuple(band): BandStats() for band in self.config.distance_bins}
+        if self.config.policy.start_with_anchor and self.config.distance_bins:
+            self._anchor_band = tuple(self.config.distance_bins[0])
+            self._anchor_completed = False
+        else:
+            self._anchor_band = None
+            self._anchor_completed = True
+        self._anchor_shots = 0
+        self._anchor_first_command_sent = False
+
         manifest_path = self.config.paths.logs_dir / f"session_{session_id}.yml"
         manifest = {
             "session_id": session_id,
@@ -103,7 +130,14 @@ class ShotEvaluator:
                 "distance": [list(b) for b in self.config.distance_bins],
                 "voltage": [list(b) for b in self.config.voltage_bins],
             },
-            "policy": self.config.policy,
+            "policy_name": self.config.policy.name,
+            "policy_flags": {
+                "send_abs_rpm": self.config.policy.send_abs_rpm,
+                "bias_step_rpm": self.config.policy.bias_step_rpm,
+                "bias_cap_rpm": self.config.policy.bias_cap_rpm,
+                "start_with_anchor": self.config.policy.start_with_anchor,
+                "anchor_samples_target": self.config.policy.anchor_samples_target,
+            },
         }
         manifest_path.write_text(_to_yaml(manifest))
 
@@ -112,6 +146,7 @@ class ShotEvaluator:
         """Produce a command in response to ``request_shot_plan``."""
         if self.session_id is None:
             raise RuntimeError("Session not initialized")
+
         raw_seq = request.get("seq")
         try:
             seq = int(raw_seq)
@@ -123,57 +158,72 @@ class ShotEvaluator:
         distance = request.get("distance_in")
         voltage = request.get("v_batt_load")
         if distance is None or voltage is None:
+            self._logger.warning("request_shot_plan missing distance or voltage; issuing noop")
             return self._build_noop_cmd(now_ms, reason="missing_fields")
+
         distance_f = float(distance)
         voltage_f = float(voltage)
-
         band = self._distance_band(distance_f)
         loiter = self._last_outcome.get(band) == "miss"
-        step = 0.0
-        if self._pending_step.get(band, 0):
-            step = float(self.config.distance_step_in)
-            self._pending_step[band] = 0
 
         self._expire_commands(now_ms)
 
-        rpm_base = self.model.predict(distance_f, voltage_f)
+        rpm_base = _coerce_float(request.get("rpm_base"), self.model.predict(distance_f, voltage_f))
         delta = self.model.delta(distance_f, voltage_f)
-        rpm_bias = int(round(delta))
+        rpm_bias_base = int(round(delta))
+        rpm_bias_adjust = self._band_bias_adjust.get(band, 0)
+        rpm_bias = rpm_bias_base + rpm_bias_adjust
 
-        miss_steps = self._band_bias_steps.get(band, 0)
-        if loiter and miss_steps:
-            sign = self._band_residual_sign.get(band, 1)
-            rpm_bias += int(max(-60, min(60, 20 * miss_steps * sign)))
-        elif loiter:
-            rpm_bias += 20  # default correction when residual sign unknown
+        if self._anchor_band == band and not self._anchor_first_command_sent:
+            rpm_bias = 0
+            self._anchor_first_command_sent = True
+
+        range_delta = 0.0
+        if not loiter:
+            pending_step = self._pending_step.pop(band, 0.0)
+            if pending_step and (self._anchor_completed or band != self._anchor_band):
+                range_delta = pending_step
+            else:
+                if pending_step:
+                    self._pending_step[band] = pending_step
+                range_delta = 0.0
 
         cmd_id = str(uuid.uuid4())
         shot_id = str(request.get("shot_id") or f"{self.session_id}-{self._shot_counter + 1}")
         rpm_target = rpm_base + rpm_bias
-        command = {
+        range_delta_int = int(round(range_delta))
+
+        command: Dict[str, Any] = {
             "type": "cmd",
             "session_id": self.session_id,
             "cmd_id": cmd_id,
             "shot_id": shot_id,
             "valid_ms": self.config.cmd_valid_ms,
             "ts_ms": now_ms,
-            "rpm_bias": rpm_bias,
-            "rpm_tgt": round(rpm_target, 2),
             "fire_now": True,
             "loiter": bool(loiter),
-            "range_delta_in": step,
+            "range_delta_in": range_delta_int,
             "request_seq": seq,
         }
+        if self.config.policy.send_abs_rpm:
+            command["rpm_target_abs"] = int(round(rpm_target))
+        else:
+            command["rpm_bias"] = int(round(rpm_bias))
+
         expires = now_ms + self.config.cmd_valid_ms
         pending = PendingCommand(
             cmd_id=cmd_id,
             shot_id=shot_id,
             distance_in=distance_f,
             voltage=voltage_f,
+            rpm_base=rpm_base,
+            rpm_bias=int(round(rpm_bias)),
             rpm_target=rpm_target,
+            range_delta_in=range_delta_int,
             sent_ts_ms=now_ms,
             expires_ts_ms=expires,
             request_seq=seq,
+            metadata={"request": request},
         )
         self._pending_commands[cmd_id] = pending
         self._pending_by_shot[shot_id] = pending
@@ -192,6 +242,16 @@ class ShotEvaluator:
             pending = self._pending_by_shot[shot_id]
             # Extend validity slightly to wait for result
             pending.expires_ts_ms += self.config.cmd_valid_ms
+            distance = _coerce_float(
+                payload.get("range_in") or payload.get("distance_in"), pending.distance_in
+            )
+            voltage = _coerce_float(payload.get("v_batt_load"), pending.voltage)
+            pending.distance_in = distance
+            pending.voltage = voltage
+            pending.rpm_tgt_cmd = _coerce_float(
+                payload.get("rpm_tgt_cmd") or payload.get("rpm_target"), pending.rpm_target
+            )
+            pending.rpm_at_fire = _coerce_float(payload.get("rpm_at_fire"), pending.rpm_at_fire or pending.rpm_target)
 
     def apply_shot_result(self, payload: Dict[str, object], now_ms: int) -> Optional[Dict[str, object]]:
         """Process the ``shot_result`` message and optionally trigger a model update."""
@@ -205,25 +265,58 @@ class ShotEvaluator:
             self._pending_commands.pop(pending.cmd_id, None)
         self._processed_shots.add(shot_id)
 
-        distance = _coerce_float(payload.get("distance_in"), pending.distance_in if pending else 0.0)
+        distance = _coerce_float(
+            payload.get("distance_in") or payload.get("range_in"),
+            pending.distance_in if pending else 0.0,
+        )
         voltage = _coerce_float(payload.get("v_batt_load"), pending.voltage if pending else 12.0)
-        rpm_at_fire = _coerce_float(payload.get("rpm_at_fire"), pending.rpm_target if pending else 0.0)
-        hit = bool(int(payload.get("hit", 0)))
+        rpm_base = _coerce_float(
+            payload.get("rpm_base"),
+            pending.rpm_base if pending else self.model.predict(distance, voltage),
+        )
+        if pending and pending.rpm_tgt_cmd is not None:
+            rpm_tgt_default = pending.rpm_tgt_cmd
+        elif pending:
+            rpm_tgt_default = pending.rpm_target
+        else:
+            rpm_tgt_default = rpm_base
+        rpm_tgt_cmd = _coerce_float(payload.get("rpm_tgt_cmd"), rpm_tgt_default)
+        rpm_at_fire = _coerce_float(
+            payload.get("rpm_at_fire"), pending.rpm_at_fire if pending else rpm_tgt_cmd
+        )
+        hit_raw = payload.get("hit")
+        if isinstance(hit_raw, bool):
+            hit = hit_raw
+        else:
+            hit = bool(int(hit_raw or 0))
         pose_x = payload.get("pose_x")
         pose_y = payload.get("pose_y")
         heading = payload.get("heading_to_tag")
 
         band = self._distance_band(distance)
+        residual = rpm_at_fire - rpm_base
+        residual_sign = 1 if residual >= 0 else -1
         self._band_stats.setdefault(band, BandStats()).update(hit)
         self._last_outcome[band] = "hit" if hit else "miss"
         if hit:
-            self._band_bias_steps[band] = 0
-            self._pending_step[band] = self.config.distance_step_in
+            self._band_bias_adjust[band] = 0
+            if self._anchor_band == band and not self._anchor_completed:
+                self._anchor_shots += 1
+                if self._anchor_shots >= self.config.policy.anchor_samples_target:
+                    self._anchor_completed = True
+                    self._pending_step[band] = float(self.config.distance_step_in)
+            else:
+                self._pending_step[band] = float(self.config.distance_step_in)
         else:
-            self._band_bias_steps[band] = min(self._band_bias_steps.get(band, 0) + 1, 3)
+            prev = self._band_bias_adjust.get(band, 0)
+            direction = residual_sign
+            step = self.config.policy.bias_step_rpm * direction
+            cap = self.config.policy.bias_cap_rpm
+            updated = prev + step
+            updated = max(-cap, min(cap, updated))
+            self._band_bias_adjust[band] = updated
 
-        residual = rpm_at_fire - self.model.predict(distance, voltage)
-        self._band_residual_sign[band] = 1 if residual >= 0 else -1
+        self._band_residual_sign[band] = residual_sign
         self._residual_history.append(residual)
 
         self.model.update_residual(
@@ -245,7 +338,9 @@ class ShotEvaluator:
             timestamp_ms=int(payload.get("ts_ms", now_ms)),
             distance=distance,
             voltage=voltage,
-            rpm_target=pending.rpm_target if pending else None,
+            rpm_base=rpm_base,
+            rpm_bias=(pending.rpm_bias if pending else int(round(rpm_tgt_cmd - rpm_base))),
+            rpm_tgt_cmd=rpm_tgt_cmd,
             rpm_at_fire=rpm_at_fire,
             hit=hit,
             pose_x=pose_x,
@@ -274,15 +369,22 @@ class ShotEvaluator:
             "shot_id": f"noop-{now_ms}",
             "valid_ms": self.config.cmd_valid_ms,
             "ts_ms": now_ms,
-            "rpm_bias": 0,
-            "rpm_tgt": 0,
             "fire_now": False,
             "loiter": False,
-            "range_delta_in": 0.0,
+            "range_delta_in": 0,
             "reason": reason,
             "request_seq": None,
         }
+        if self.config.policy.send_abs_rpm:
+            cmd["rpm_target_abs"] = 0
+        else:
+            cmd["rpm_bias"] = 0
         return cmd
+
+    def safe_noop(self, now_ms: int, reason: str) -> Dict[str, object]:
+        """Public helper to provide a safe, no-op command."""
+
+        return self._build_noop_cmd(now_ms, reason=reason)
 
     def _distance_band(self, distance_in: float) -> Tuple[float, float]:
         for band in self.config.distance_bins:
@@ -309,7 +411,9 @@ class ShotEvaluator:
                     "ts",
                     "range_in",
                     "v_batt_load",
-                    "rpm_tgt",
+                    "rpm_base",
+                    "rpm_bias",
+                    "rpm_tgt_cmd",
                     "rpm_at_fire",
                     "hit",
                     "pose_x",
@@ -327,7 +431,9 @@ class ShotEvaluator:
         timestamp_ms: int,
         distance: float,
         voltage: float,
-        rpm_target: Optional[float],
+        rpm_base: float,
+        rpm_bias: int,
+        rpm_tgt_cmd: float,
         rpm_at_fire: float,
         hit: bool,
         pose_x: Optional[float],
@@ -344,7 +450,9 @@ class ShotEvaluator:
                     timestamp_ms,
                     distance,
                     voltage,
-                    rpm_target,
+                    rpm_base,
+                    rpm_bias,
+                    rpm_tgt_cmd,
                     rpm_at_fire,
                     int(hit),
                     pose_x,

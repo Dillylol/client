@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import time
 import uuid
 from collections import deque
@@ -64,7 +65,7 @@ class SessionState:
 
     def offline(self, now_ms: int) -> bool:
         if self.last_obs_ts_ms is None:
-            return True
+            return False
         return (now_ms - self.last_obs_ts_ms) > 1500
 
 
@@ -82,6 +83,7 @@ class ShotServer:
         self.gui_clients: Set[WebSocketServerProtocol] = set()
         self._pinger_task: Optional[asyncio.Task[None]] = None
         self._health_task: Optional[asyncio.Task[None]] = None
+        self._logger = logging.getLogger(__name__)
 
     # -----------------------------------------------------------------
     async def robot_handler(self, ws: WebSocketServerProtocol) -> None:
@@ -170,7 +172,14 @@ class ShotServer:
             "type": "hello_ack",
             "session_id": session_id,
             "seq": self.session.next_seq(),
-            "policy": self.config.policy,
+            "policy": self.config.policy.name,
+            "policy_flags": {
+                "send_abs_rpm": self.config.policy.send_abs_rpm,
+                "bias_step_rpm": self.config.policy.bias_step_rpm,
+                "bias_cap_rpm": self.config.policy.bias_cap_rpm,
+                "start_with_anchor": self.config.policy.start_with_anchor,
+                "anchor_samples_target": self.config.policy.anchor_samples_target,
+            },
             "model_version": self.model.model_version,
             "ts_ms": now_ms,
         }
@@ -178,7 +187,11 @@ class ShotServer:
         await self._broadcast_ui({"type": "hello", "payload": ack})
 
     async def _handle_request(self, ws: WebSocketServerProtocol, obj: Dict[str, Any], now_ms: int) -> None:
-        command = self.evaluator.plan_shot(obj, now_ms)
+        if self.session.offline(now_ms):
+            self._logger.warning("Robot marked offline; issuing safe noop command")
+            command = self.evaluator.safe_noop(now_ms, reason="offline")
+        else:
+            command = self.evaluator.plan_shot(obj, now_ms)
         command_msg = dict(command)
         command_msg.update(
             {

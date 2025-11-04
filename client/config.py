@@ -9,6 +9,18 @@ import yaml
 
 
 @dataclass(frozen=True)
+class PolicyConfig:
+    """Policy-level knobs controlling command emission."""
+
+    name: str
+    send_abs_rpm: bool
+    bias_step_rpm: int
+    bias_cap_rpm: int
+    start_with_anchor: bool
+    anchor_samples_target: int
+
+
+@dataclass(frozen=True)
 class ClientPaths:
     """Convenience container for file system paths used by the client."""
 
@@ -22,7 +34,7 @@ class ClientConfig:
     """Strongly-typed configuration for the evaluation workflow."""
 
     schema: str
-    policy: str
+    policy: PolicyConfig
     cmd_valid_ms: int
     distance_step_in: float
     alpha_ewma: float
@@ -40,7 +52,7 @@ class ClientConfig:
         data = yaml.safe_load(path.read_text())
         if data.get("schema") != "config/v1":
             raise ValueError(f"Unsupported config schema: {data.get('schema')}")
-        policy = data.get("policy", "simple_bandit_v1")
+        policy = _parse_policy(data.get("policy", {}))
         security = data.get("security", {})
         paths_raw = data.get("paths", {})
         artifacts_dir = Path(paths_raw.get("artifacts_dir", "artifacts")).expanduser()
@@ -94,3 +106,27 @@ def _parse_rate_limit(raw: object) -> int:
         except ValueError as exc:  # pragma: no cover - defensive
             raise ValueError(f"Invalid rate limit spec: {raw}") from exc
     raise ValueError(f"Unsupported rate limit spec: {raw}")
+
+
+def _parse_policy(raw: object) -> PolicyConfig:
+    if isinstance(raw, str):
+        name = raw
+        payload: dict = {}
+    elif isinstance(raw, dict):
+        name = str(raw.get("name", "rpm_bias_bandit"))
+        payload = raw
+    else:
+        raise ValueError(f"Unsupported policy definition: {raw}")
+    send_abs = bool(payload.get("send_abs_rpm", False))
+    bias_step = int(payload.get("bias_step_rpm", 20))
+    bias_cap = int(payload.get("bias_cap_rpm", 60))
+    start_anchor = bool(payload.get("start_with_anchor", True))
+    anchor_target = int(payload.get("anchor_samples_target", 12))
+    return PolicyConfig(
+        name=name,
+        send_abs_rpm=send_abs,
+        bias_step_rpm=bias_step,
+        bias_cap_rpm=bias_cap,
+        start_with_anchor=start_anchor,
+        anchor_samples_target=anchor_target,
+    )

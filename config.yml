@@ -1,7 +1,13 @@
 # Pedro evaluation client configuration
 # Schema: config/v1
 schema: config/v1
-policy: simple_bandit_v1
+policy:
+  name: rpm_bias_bandit
+  send_abs_rpm: false
+  bias_step_rpm: 20
+  bias_cap_rpm: 60
+  start_with_anchor: true
+  anchor_samples_target: 12
 security:
   require_token: false
   token: ""
@@ -9,7 +15,7 @@ cmd_valid_ms: 800
 distance_step_in: 4.0
 alpha_ewma: 0.15
 update_cadence_shots: 10
-update_rate_limit: 10  # minimum shots between rpm_model_update pushes
+update_rate_limit: 1_per_10
 update_rmse_improvement_pct: 5.0
 bins:
   distance:
