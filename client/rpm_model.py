@@ -19,6 +19,7 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 import json
 import math
 import os
+import tempfile
 
 SCHEMA = "rpm_model/v1"
 
@@ -120,13 +121,13 @@ class RpmModel:
         if self.note is not None:
             payload["note"] = self.note
         target.parent.mkdir(parents=True, exist_ok=True)
-        tmp_path = target.with_suffix(target.suffix + ".tmp")
-        with tmp_path.open("w", encoding="utf-8") as handle:
-            json.dump(payload, handle, indent=2, sort_keys=True)
-            handle.flush()
-            os.fsync(handle.fileno())
+        tmp_dir = target.parent
+        with tempfile.NamedTemporaryFile("w", dir=tmp_dir, delete=False) as tmp:
+            json.dump(payload, tmp, indent=2, sort_keys=True)
+            tmp.flush()
+            os.fsync(tmp.fileno())
+            tmp_path = Path(tmp.name)
         tmp_path.replace(target)
-        self.path = target
 
     # --- Base curve --------------------------------------------------
     def base_rpm(self, distance_in: float) -> float:

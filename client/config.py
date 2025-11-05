@@ -9,18 +9,6 @@ import yaml
 
 
 @dataclass(frozen=True)
-class PolicyConfig:
-    """Policy-level knobs controlling command emission."""
-
-    name: str
-    send_abs_rpm: bool
-    bias_step_rpm: int
-    bias_cap_rpm: int
-    start_with_anchor: bool
-    anchor_samples_target: int
-
-
-@dataclass(frozen=True)
 class ClientPaths:
     """Convenience container for file system paths used by the client."""
 
@@ -30,11 +18,26 @@ class ClientPaths:
 
 
 @dataclass(frozen=True)
+class PolicyFlags:
+    """Configuration flags controlling the shot planning policy."""
+
+    name: str
+    send_abs_rpm: bool
+    bias_step_rpm: int
+    bias_cap_rpm: int
+    start_with_anchor: bool
+    anchor_shots_required: int
+
+
+@dataclass(frozen=True)
 class ClientConfig:
     """Strongly-typed configuration for the evaluation workflow."""
 
     schema: str
-    policy: PolicyConfig
+    policy: PolicyFlags
+    server_host: str
+    server_port: int
+    gui_port: int
     cmd_valid_ms: int
     distance_step_in: float
     alpha_ewma: float
@@ -52,8 +55,9 @@ class ClientConfig:
         data = yaml.safe_load(path.read_text())
         if data.get("schema") != "config/v1":
             raise ValueError(f"Unsupported config schema: {data.get('schema')}")
-        policy = _parse_policy(data.get("policy", {}))
+        policy_flags = _parse_policy(data.get("policy", {}))
         security = data.get("security", {})
+        server = data.get("server", {})
         paths_raw = data.get("paths", {})
         artifacts_dir = Path(paths_raw.get("artifacts_dir", "artifacts")).expanduser()
         logs_dir = Path(paths_raw.get("logs_dir", "logs")).expanduser()
@@ -67,7 +71,6 @@ class ClientConfig:
         voltage_bins = [tuple(_normalize_range(pair)) for pair in data["bins"]["voltage"]]
         return cls(
             schema=data["schema"],
-            policy=policy,
             cmd_valid_ms=int(data.get("cmd_valid_ms", 800)),
             distance_step_in=float(data.get("distance_step_in", 4.0)),
             alpha_ewma=float(data.get("alpha_ewma", 0.15)),
@@ -79,6 +82,10 @@ class ClientConfig:
             paths=ClientPaths(artifacts_dir=artifacts_dir, logs_dir=logs_dir, model_path=model_path),
             require_token=bool(security.get("require_token", False)),
             token=str(security.get("token", "")),
+            policy=policy_flags,
+            server_host=str(server.get("host", "0.0.0.0")),
+            server_port=int(server.get("port", 8765)),
+            gui_port=int(server.get("gui_port", 8766)),
         )
 
 
@@ -108,25 +115,24 @@ def _parse_rate_limit(raw: object) -> int:
     raise ValueError(f"Unsupported rate limit spec: {raw}")
 
 
-def _parse_policy(raw: object) -> PolicyConfig:
+def _parse_policy(raw: object) -> PolicyFlags:
     if isinstance(raw, str):
-        name = raw
-        payload: dict = {}
-    elif isinstance(raw, dict):
-        name = str(raw.get("name", "rpm_bias_bandit"))
-        payload = raw
-    else:
-        raise ValueError(f"Unsupported policy definition: {raw}")
-    send_abs = bool(payload.get("send_abs_rpm", False))
-    bias_step = int(payload.get("bias_step_rpm", 20))
-    bias_cap = int(payload.get("bias_cap_rpm", 60))
-    start_anchor = bool(payload.get("start_with_anchor", True))
-    anchor_target = int(payload.get("anchor_samples_target", 12))
-    return PolicyConfig(
-        name=name,
-        send_abs_rpm=send_abs,
-        bias_step_rpm=bias_step,
-        bias_cap_rpm=bias_cap,
-        start_with_anchor=start_anchor,
-        anchor_samples_target=anchor_target,
-    )
+        return PolicyFlags(
+            name=raw,
+            send_abs_rpm=False,
+            bias_step_rpm=20,
+            bias_cap_rpm=60,
+            start_with_anchor=True,
+            anchor_shots_required=12,
+        )
+    if isinstance(raw, dict):
+        name = str(raw.get("name", "rpm_anchor_v1"))
+        return PolicyFlags(
+            name=name,
+            send_abs_rpm=bool(raw.get("send_abs_rpm", False)),
+            bias_step_rpm=int(raw.get("bias_step_rpm", 20)),
+            bias_cap_rpm=int(raw.get("bias_cap_rpm", 60)),
+            start_with_anchor=bool(raw.get("start_with_anchor", True)),
+            anchor_shots_required=int(raw.get("anchor_shots_required", 12)),
+        )
+    raise ValueError(f"Unsupported policy specification: {raw}")
