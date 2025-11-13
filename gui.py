@@ -44,6 +44,10 @@ class DevControllerApp(tk.Tk):
         self._tree_paths: Dict[str, str] = {}
         self._search_results: List[str] = []
         self._log_filters: Dict[str, tk.BooleanVar] = {}
+        self.rl_status_var = tk.StringVar(value="STOPPED")
+        self.rl_endpoint_var = tk.StringVar(value="—")
+        self.rl_session_var = tk.StringVar(value="—")
+        self.rl_log_entries: List[str] = []
 
         self.saved_commands: List[Dict[str, Any]] = [
             {"label": "Drive Forward", "name": "drive", "args": {"t": 0.5, "p": 0.5, "duration_ms": 400}},
@@ -65,6 +69,8 @@ class DevControllerApp(tk.Tk):
         self.api.on_flat = lambda flat: self.after(0, self._handle_flat_map, flat)
         self.api.on_stdout = lambda line: self.after(0, self._append_stdout, line)
         self.api.on_raw_frame = lambda frame: self.after(0, self._append_log_entry, frame)
+        self.api.on_rl_event = lambda event: self.after(0, self._handle_rl_event, event)
+        self.api.flush_rl_events()
 
     def _build_ui(self) -> None:
         style = ttk.Style(self)
@@ -110,6 +116,10 @@ class DevControllerApp(tk.Tk):
         self.requests_tab = ttk.Frame(self.nb, padding=12, style="App.TFrame")
         self.nb.add(self.requests_tab, text="Commands")
         self._build_requests_tab(self.requests_tab)
+
+        self.rl_tab = ttk.Frame(self.nb, padding=12, style="App.TFrame")
+        self.nb.add(self.rl_tab, text="RL")
+        self._build_rl_tab(self.rl_tab)
 
         console_pane = ttk.Panedwindow(right_pane, orient=tk.HORIZONTAL)
         right_pane.add(console_pane, weight=2)
@@ -258,6 +268,45 @@ class DevControllerApp(tk.Tk):
         self.history_tree.configure(yscrollcommand=history_scroll.set)
         self.history_tree.pack(fill=tk.BOTH, expand=True)
 
+    def _build_rl_tab(self, frame: ttk.Frame) -> None:
+        frame.columnconfigure(0, weight=1)
+
+        status_frame = ttk.Frame(frame, style="App.TFrame")
+        status_frame.pack(fill=tk.X, pady=(0, 12))
+        status_frame.columnconfigure(0, weight=1)
+
+        ttk.Label(status_frame, text="RL Server State", style="StatusHeader.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Label(status_frame, textvariable=self.rl_status_var, style="StatusValue.TLabel").grid(
+            row=1, column=0, sticky="w", pady=(0, 6)
+        )
+
+        ttk.Label(status_frame, text="Endpoint", style="StatusHeader.TLabel").grid(row=2, column=0, sticky="w")
+        ttk.Label(status_frame, textvariable=self.rl_endpoint_var, style="StatusValue.TLabel").grid(
+            row=3, column=0, sticky="w", pady=(0, 6)
+        )
+
+        ttk.Label(status_frame, text="Active Session", style="StatusHeader.TLabel").grid(row=4, column=0, sticky="w")
+        ttk.Label(status_frame, textvariable=self.rl_session_var, style="StatusValue.TLabel").grid(
+            row=5, column=0, sticky="w"
+        )
+
+        log_frame = ttk.Frame(frame, style="App.TFrame")
+        log_frame.pack(fill=tk.BOTH, expand=True)
+
+        header_row = ttk.Frame(log_frame, style="App.TFrame")
+        header_row.pack(fill=tk.X, pady=(0, 6))
+        ttk.Label(header_row, text="Event Log", style="Title.TLabel").pack(side=tk.LEFT)
+        ttk.Button(header_row, text="Clear", command=self._clear_rl_log).pack(side=tk.RIGHT)
+
+        self.rl_log = scrolledtext.ScrolledText(
+            log_frame,
+            height=18,
+            background="#1e1e1e",
+            foreground="#d4d4d4",
+            state=tk.DISABLED,
+        )
+        self.rl_log.pack(fill=tk.BOTH, expand=True)
+
     def _build_console(self, pane: ttk.Panedwindow) -> None:
         input_frame = ttk.Frame(pane, padding=12, style="App.TFrame")
         pane.add(input_frame, weight=1)
@@ -362,6 +411,59 @@ class DevControllerApp(tk.Tk):
         self.log_entries = self.log_entries[-500:]
         self._refresh_log_display()
 
+    def _handle_rl_event(self, event: Dict[str, Any]) -> None:
+        if not hasattr(self, "rl_status_var"):
+            return
+        if not isinstance(event, dict):
+            return
+        timestamp = event.get("timestamp")
+        if isinstance(timestamp, (int, float)):
+            ts_str = time.strftime("%H:%M:%S", time.localtime(timestamp))
+        else:
+            ts_str = time.strftime("%H:%M:%S")
+        kind = event.get("kind")
+        if kind == "status":
+            state = str(event.get("state", "unknown")).upper()
+            self.rl_status_var.set(state)
+            details = event.get("details") or {}
+            endpoint = details.get("endpoint")
+            if endpoint:
+                self.rl_endpoint_var.set(str(endpoint))
+            elif state == "STOPPED":
+                self.rl_endpoint_var.set("—")
+            session_id = details.get("session_id")
+            if session_id:
+                self.rl_session_var.set(str(session_id))
+            elif state in {"ROBOT_DISCONNECTED", "STOPPED"}:
+                self.rl_session_var.set("—")
+            message = details.get("message") or details.get("state") or state
+            line = f"[status] {state}: {message}"
+            if endpoint and endpoint not in line:
+                line += f" ({endpoint})"
+            self._append_rl_log(ts_str, line.strip())
+        elif kind == "event":
+            payload = event.get("event") or {}
+            evt_type = str(payload.get("type", "unknown"))
+            direction = payload.get("direction")
+            direction_prefix = f"{direction} " if direction else ""
+            payload_body = payload.get("payload")
+            if isinstance(payload_body, dict):
+                summary = json.dumps(payload_body, ensure_ascii=False, default=str)
+                session_id = payload_body.get("session_id")
+                if session_id:
+                    self.rl_session_var.set(str(session_id))
+            else:
+                summary = str(payload_body)
+            if len(summary) > 400:
+                summary = summary[:397] + "..."
+            self._append_rl_log(ts_str, f"{direction_prefix}{evt_type}: {summary}")
+        elif kind == "error":
+            message = str(event.get("message", "Unknown error"))
+            self.rl_status_var.set("ERROR")
+            self._append_rl_log(ts_str, f"[error] {message}")
+        else:
+            self._append_rl_log(ts_str, f"{kind}: {event}")
+
     # ------------------------------------------------------------------
     # Utility helpers
     def _set_status_value(self, key: str, value: Any, *, formatter: Optional[Callable[[Any], str]] = None) -> None:
@@ -464,6 +566,28 @@ class DevControllerApp(tk.Tk):
             self.log_text.insert(tk.END, f"[{ts_str}] {frame_type}: {entry['frame']}\n")
         self.log_text.configure(state=tk.DISABLED)
         self.log_text.see(tk.END)
+
+    def _append_rl_log(self, timestamp: str, message: str) -> None:
+        if not hasattr(self, "rl_log"):
+            return
+        line = f"[{timestamp}] {message}"
+        self.rl_log_entries.append(line)
+        self.rl_log_entries = self.rl_log_entries[-400:]
+        self.rl_log.configure(state=tk.NORMAL)
+        self.rl_log.delete("1.0", tk.END)
+        if self.rl_log_entries:
+            self.rl_log.insert(tk.END, "\n".join(self.rl_log_entries) + "\n")
+        self.rl_log.configure(state=tk.DISABLED)
+        self.rl_log.see(tk.END)
+
+    def _clear_rl_log(self) -> None:
+        if not hasattr(self, "rl_log"):
+            return
+        self.rl_log_entries.clear()
+        self.rl_log.configure(state=tk.NORMAL)
+        self.rl_log.delete("1.0", tk.END)
+        self.rl_log.configure(state=tk.DISABLED)
+        self.status_bar_var.set("RL log cleared")
 
     def _export_csv(self) -> None:
         if not self.flat_map:

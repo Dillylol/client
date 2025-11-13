@@ -78,12 +78,21 @@ class SessionState:
 class ShotServer:
     """Coordinate RPM-only planning and telemetry over WebSockets."""
 
-    def __init__(self, config: ClientConfig, model: RpmModel) -> None:
+    def __init__(
+        self,
+        config: ClientConfig,
+        model: RpmModel,
+        *,
+        on_event: Optional[Callable[[Dict[str, Any]], None]] = None,
+        on_status: Optional[Callable[[Dict[str, Any]], None]] = None,
+    ) -> None:
         self.config = config
         self.model = model
         self.evaluator = ShotEvaluator(config, model)
         self.session = SessionState()
         self._robot_ws: Optional[WebSocketServerProtocol] = None
+        self._on_event = on_event
+        self._on_status = on_status
 
     async def handle(self, ws: WebSocketServerProtocol, path: str) -> None:
         if path != _JULES_PATH:
@@ -96,6 +105,12 @@ class ShotServer:
             return
 
         logger.info("Robot connected from %s", ws.remote_address)
+        self._emit_status(
+            {
+                "state": "robot_connected",
+                "remote": str(ws.remote_address),
+            }
+        )
         self._robot_ws = ws
         self.session.reset()
         try:
@@ -116,6 +131,7 @@ class ShotServer:
         finally:
             self._robot_ws = None
             self.session.reset()
+            self._emit_status({"state": "robot_disconnected"})
 
     async def _handle_message(self, ws: WebSocketServerProtocol, line: str) -> None:
         try:
@@ -129,6 +145,13 @@ class ShotServer:
         now_ms = _now_ms()
 
         if msg_type == "hello":
+            self._emit_event(
+                {
+                    "direction": "inbound",
+                    "type": msg_type,
+                    "payload": obj,
+                }
+            )
             await self._handle_hello(ws, obj, seq, now_ms)
             return
 
@@ -143,23 +166,72 @@ class ShotServer:
             return
 
         if msg_type == "request_shot_plan":
+            self._emit_event(
+                {
+                    "direction": "inbound",
+                    "type": msg_type,
+                    "payload": obj,
+                }
+            )
             await self._handle_request(ws, obj, now_ms)
         elif msg_type == "obs":
             self.session.mark_obs(obj.get("ts_ms"), now_ms)
+            self._emit_event(
+                {
+                    "direction": "inbound",
+                    "type": msg_type,
+                    "payload": obj,
+                }
+            )
         elif msg_type == "token_shot_fired":
             self.session.register_seq(msg_type, seq)
             self.evaluator.record_shot_fired(obj)
+            self._emit_event(
+                {
+                    "direction": "inbound",
+                    "type": msg_type,
+                    "payload": obj,
+                }
+            )
         elif msg_type == "shot_result":
             self.session.mark_obs(obj.get("ts_ms"), now_ms)
             update = self.evaluator.apply_shot_result(obj, now_ms)
+            self._emit_event(
+                {
+                    "direction": "inbound",
+                    "type": msg_type,
+                    "payload": obj,
+                }
+            )
             if update:
                 await self._send_model_update(ws, update, now_ms)
         elif msg_type == "rpm_model_update":
             logger.info("Robot acknowledged rpm_model_update: %s", obj.get("update_id"))
+            self._emit_event(
+                {
+                    "direction": "inbound",
+                    "type": msg_type,
+                    "payload": obj,
+                }
+            )
         elif msg_type == "pong":
             self.session.mark_obs(obj.get("ts_ms"), now_ms)
+            self._emit_event(
+                {
+                    "direction": "inbound",
+                    "type": msg_type,
+                    "payload": obj,
+                }
+            )
         else:
             logger.debug("Unhandled message type: %s", msg_type)
+            self._emit_event(
+                {
+                    "direction": "inbound",
+                    "type": msg_type or "unknown",
+                    "payload": obj,
+                }
+            )
 
     async def _handle_hello(
         self,
@@ -193,6 +265,19 @@ class ShotServer:
         }
         await ws.send(json.dumps(ack))
         logger.info("hello_ack sent for session %s", session_id)
+        self._emit_status(
+            {
+                "state": "session_started",
+                "session_id": session_id,
+            }
+        )
+        self._emit_event(
+            {
+                "direction": "outbound",
+                "type": "hello_ack",
+                "payload": ack,
+            }
+        )
 
     async def _handle_request(
         self,
@@ -216,6 +301,13 @@ class ShotServer:
         await ws.send(json.dumps(cmd))
         logger.debug("Sent cmd %s", cmd.get("cmd_id"))
         self.session.register_seq("request_shot_plan", obj.get("seq"))
+        self._emit_event(
+            {
+                "direction": "outbound",
+                "type": "cmd",
+                "payload": cmd,
+            }
+        )
 
     async def _send_model_update(
         self,
@@ -238,6 +330,27 @@ class ShotServer:
         logger.info(
             "Pushed rpm_model_update version=%s", payload.get("model_version")
         )
+        self._emit_event(
+            {
+                "direction": "outbound",
+                "type": "rpm_model_update",
+                "payload": payload,
+            }
+        )
+
+    def _emit_event(self, event: Dict[str, Any]) -> None:
+        if self._on_event:
+            try:
+                self._on_event(event)
+            except Exception:  # noqa: BLE001
+                logger.exception("RL event callback raised")
+
+    def _emit_status(self, status: Dict[str, Any]) -> None:
+        if self._on_status:
+            try:
+                self._on_status(status)
+            except Exception:  # noqa: BLE001
+                logger.exception("RL status callback raised")
 
     def _enforce_rpm_surface(self, cmd: Dict[str, Any]) -> None:
         has_bias = "rpm_bias" in cmd and cmd["rpm_bias"] is not None
@@ -250,20 +363,39 @@ class ShotServer:
         if not has_bias and not has_abs:
             cmd["rpm_bias"] = 0
 
-    async def run(self) -> None:
+    async def run(self, *, stop_event: Optional[asyncio.Event] = None) -> None:
         logger.info(
             "Listening for robot on ws://%s:%d%s",
             self.config.server_host,
             self.config.server_port,
             _JULES_PATH,
         )
-        async with serve(
+        self._emit_status(
+            {
+                "state": "listening",
+                "endpoint": f"ws://{self.config.server_host}:{self.config.server_port}{_JULES_PATH}",
+            }
+        )
+        server = await serve(
             self.handle,
             self.config.server_host,
             self.config.server_port,
             ping_interval=None,
-        ):
-            await asyncio.Future()
+        )
+        try:
+            if stop_event is None:
+                await asyncio.Future()
+            else:
+                await stop_event.wait()
+        finally:
+            server.close()
+            await server.wait_closed()
+            self._emit_status(
+                {
+                    "state": "stopped",
+                    "endpoint": f"ws://{self.config.server_host}:{self.config.server_port}{_JULES_PATH}",
+                }
+            )
 
 
 FrameCallback = Callable[[Dict[str, Any]], None]

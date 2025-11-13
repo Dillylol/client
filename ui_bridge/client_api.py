@@ -9,6 +9,7 @@ from typing import Callable, Dict, Optional
 from ingest.ingester import Ingester
 from metrics.computations import MetricsComputer
 from transport.link_manager import LinkManager
+from transport.rl_manager import RLManager
 
 
 class ClientAPI:
@@ -16,6 +17,7 @@ class ClientAPI:
         self.link = LinkManager()
         self.ingester = Ingester()
         self.metrics = MetricsComputer(on_metrics=self._emit_metrics)
+        self.rl_manager = RLManager()
 
         self.on_status: Optional[Callable[[Dict[str, object]], None]] = None
         self.on_metrics: Optional[Callable[[Dict[str, object]], None]] = None
@@ -23,18 +25,23 @@ class ClientAPI:
         self.on_flat: Optional[Callable[[Dict[str, object]], None]] = None
         self.on_stdout: Optional[Callable[[str], None]] = None
         self.on_raw_frame: Optional[Callable[[Dict[str, object]], None]] = None
+        self.on_rl_event: Optional[Callable[[Dict[str, object]], None]] = None
 
         self.link.on_frame = self._handle_frame
         self.link.on_status = self._handle_status
         self.ingester.on_tree = self._handle_tree_update
         self.ingester.on_flat = self._handle_flat_update
         self.ingester.on_stdout = self._handle_stdout
+        self.rl_manager.on_event = self._handle_rl_event
+
+        self.rl_manager.start()
 
         self._metrics_lock = threading.Lock()
 
         self._status_queue: "queue.SimpleQueue[Dict[str, object]]" = queue.SimpleQueue()
         self._stdout_queue: "queue.SimpleQueue[str]" = queue.SimpleQueue()
         self._frame_queue: "queue.SimpleQueue[Dict[str, object]]" = queue.SimpleQueue()
+        self._rl_queue: "queue.SimpleQueue[Dict[str, object]]" = queue.SimpleQueue()
 
         self._latest_tree: Optional[Dict[str, object]] = None
         self._latest_flat: Optional[Dict[str, object]] = None
@@ -79,6 +86,9 @@ class ClientAPI:
     def manual_ping(self) -> None:
         self.link.manual_ping()
 
+    def flush_rl_events(self) -> None:
+        self._drain_rl_events()
+
     # ------------------------------------------------------------------
     def _handle_frame(self, frame: Dict[str, object]) -> None:
         with self._metrics_lock:
@@ -108,6 +118,12 @@ class ClientAPI:
     def _handle_stdout(self, line: str) -> None:
         self._stdout_queue.put(line)
 
+    def _handle_rl_event(self, event: Dict[str, object]) -> None:
+        if self.on_rl_event:
+            self.on_rl_event(event)
+        else:
+            self._rl_queue.put(event)
+
     def _emit_metrics(self, metrics: Dict[str, object]) -> None:
         if self.on_metrics:
             self.on_metrics(metrics)
@@ -120,6 +136,7 @@ class ClientAPI:
             self._drain_status()
             self._drain_stdout()
             self._drain_frames()
+            self._drain_rl_events()
 
             if self._flat_pending_metrics and self._latest_flat is not None:
                 with self._metrics_lock:
@@ -176,4 +193,14 @@ class ClientAPI:
             except queue.Empty:
                 break
             self.on_raw_frame(frame)
+
+    def _drain_rl_events(self) -> None:
+        if not self.on_rl_event:
+            return
+        while True:
+            try:
+                event = self._rl_queue.get_nowait()
+            except queue.Empty:
+                break
+            self.on_rl_event(event)
 
