@@ -13,7 +13,7 @@ if sys.platform == "win32":
 from gui import DevControllerApp
 
 if __name__ == "__main__":
-    # 1. Get the directory where main.py is located
+    # 1. Get the directory where main.py is locatedfgfgfbnfbn
     #    (e.g., ".../dillylol/client/")
     APP_ROOT = Path(__file__).parent.resolve()
     
