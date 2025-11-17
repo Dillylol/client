@@ -8,13 +8,17 @@ from pathlib import Path
 import tkinter as tk
 from tkinter import ttk, scrolledtext, messagebox, filedialog
 
+from PIL import Image, ImageDraw, ImageTk
+
 import codec
 from ui_bridge.client_api import ClientAPI
+from cv.video_pipeline import VideoFramePayload
 
 FILTER_TAGS = [
     ("heartbeat", "Heartbeat"),
     ("snapshot", "Snapshots"),
     ("diff", "Diffs"),
+    ("artifact_detections", "Artifacts"),
 ]
 
 
@@ -54,6 +58,11 @@ class DevControllerApp(tk.Tk):
         self.rl_session_var = tk.StringVar(value="—")
         self.rl_log_entries: List[str] = []
         self.pending_shot_widgets: Dict[str, tk.Widget] = {}
+        self.video_status_var = tk.StringVar(value="Waiting for video…")
+        self._video_photo: Optional[ImageTk.PhotoImage] = None
+        self.latest_artifacts: List[Dict[str, Any]] = []
+        self.video_canvas: Optional[tk.Label] = None
+        self.artifact_tree: Optional[ttk.Treeview] = None
 
         self.saved_commands: List[Dict[str, Any]] = [
             {"label": "Drive Forward", "name": "drive", "args": {"t": 0.5, "p": 0.5, "duration_ms": 400}},
@@ -76,6 +85,7 @@ class DevControllerApp(tk.Tk):
         self.api.on_stdout = lambda line: self.after(0, self._append_stdout, line)
         self.api.on_raw_frame = lambda frame: self.after(0, self._append_log_entry, frame)
         self.api.on_rl_event = lambda event: self.after(0, self._handle_rl_event, event)
+        self.api.on_video_frame = lambda frame: self.after(0, self._handle_video_frame, frame)
         self.api.flush_rl_events()
 
     def _build_ui(self) -> None:
@@ -118,6 +128,10 @@ class DevControllerApp(tk.Tk):
         self.telemetry_tab = ttk.Frame(self.nb, padding=12, style="App.TFrame")
         self.nb.add(self.telemetry_tab, text="Telemetry")
         self._build_telemetry_tab(self.telemetry_tab)
+
+        self.cv_tab = ttk.Frame(self.nb, padding=12, style="App.TFrame")
+        self.nb.add(self.cv_tab, text="Camera")
+        self._build_cv_tab(self.cv_tab)
 
         self.requests_tab = ttk.Frame(self.nb, padding=12, style="App.TFrame")
         self.nb.add(self.requests_tab, text="Commands")
@@ -231,6 +245,37 @@ class DevControllerApp(tk.Tk):
         self.log_text = scrolledtext.ScrolledText(log_frame, height=10, state=tk.DISABLED, background="#252526", foreground="#d4d4d4")
         self.log_text.pack(fill=tk.BOTH, expand=True)
         self.log_entries: List[Dict[str, Any]] = []
+
+    def _build_cv_tab(self, frame: ttk.Frame) -> None:
+        frame.columnconfigure(0, weight=2)
+        frame.columnconfigure(1, weight=1)
+
+        video_frame = ttk.Frame(frame, padding=(0, 0, 12, 0), style="App.TFrame")
+        video_frame.grid(row=0, column=0, sticky="nsew")
+        ttk.Label(video_frame, text="Robot Camera", style="Title.TLabel").pack(anchor="w", pady=(0, 6))
+        self.video_canvas = tk.Label(video_frame, background="#000000", width=640, height=360)
+        self.video_canvas.pack(fill=tk.BOTH, expand=True)
+        ttk.Label(video_frame, textvariable=self.video_status_var, style="StatusHeader.TLabel").pack(anchor="w", pady=(6, 0))
+
+        detections_frame = ttk.Frame(frame, style="App.TFrame")
+        detections_frame.grid(row=0, column=1, sticky="nsew")
+        detections_frame.columnconfigure(0, weight=1)
+        detections_frame.rowconfigure(0, weight=0)
+        detections_frame.rowconfigure(1, weight=1)
+        ttk.Label(detections_frame, text="Artifact Detections", style="Title.TLabel").grid(row=0, column=0, sticky="w", pady=(0, 6))
+
+        columns = ("bbox", "center", "area")
+        self.artifact_tree = ttk.Treeview(detections_frame, columns=columns, show="headings", height=12)
+        self.artifact_tree.heading("bbox", text="BBox (x,y,w,h)")
+        self.artifact_tree.heading("center", text="Center (x,y)")
+        self.artifact_tree.heading("area", text="Area")
+        self.artifact_tree.column("bbox", width=170, anchor="center")
+        self.artifact_tree.column("center", width=130, anchor="center")
+        self.artifact_tree.column("area", width=80, anchor="e")
+        self.artifact_tree.grid(row=1, column=0, sticky="nsew")
+        scroll = ttk.Scrollbar(detections_frame, orient=tk.VERTICAL, command=self.artifact_tree.yview)
+        scroll.grid(row=1, column=1, sticky="ns")
+        self.artifact_tree.configure(yscrollcommand=scroll.set)
 
     def _build_requests_tab(self, frame: ttk.Frame) -> None:
         pane = ttk.Panedwindow(frame, orient=tk.HORIZONTAL)
@@ -492,6 +537,45 @@ class DevControllerApp(tk.Tk):
             self._append_rl_log(ts_str, f"[error] {message}")
         else:
             self._append_rl_log(ts_str, f"{kind}: {event}")
+
+    def _handle_video_frame(self, frame: VideoFramePayload) -> None:
+        if not self.video_canvas:
+            return
+        image = frame.image.copy()
+        draw = ImageDraw.Draw(image)
+        for det in frame.detections:
+            x, y, w, h = det.bbox
+            draw.rectangle([(x, y), (x + w, y + h)], outline="#4caf50", width=2)
+            draw.text((x + 4, y + 4), f"{det.area:.0f}", fill="#ffffff")
+        width, height = image.size
+        target_w = 640
+        target_h = max(1, int(target_w * height / max(1, width)))
+        resized = image.resize((target_w, target_h))
+        photo = ImageTk.PhotoImage(resized)
+        self.video_canvas.configure(image=photo)
+        self.video_canvas.image = photo
+        self._video_photo = photo
+        ts_text = time.strftime("%H:%M:%S", time.localtime(frame.ts_ms / 1000))
+        self.video_status_var.set(f"{len(frame.detections)} artifacts — {ts_text}")
+        self._update_artifact_tree(frame.detections)
+
+    def _update_artifact_tree(self, detections: List[Any]) -> None:
+        if not self.artifact_tree:
+            return
+        tree = self.artifact_tree
+        for item in tree.get_children():
+            tree.delete(item)
+        for det in detections:
+            bbox = getattr(det, "bbox", (0, 0, 0, 0))
+            center = getattr(det, "center", (0.0, 0.0))
+            area = getattr(det, "area", 0.0)
+            bbox_text = f"{int(bbox[0])}, {int(bbox[1])}, {int(bbox[2])}, {int(bbox[3])}"
+            center_text = f"{center[0]:.1f}, {center[1]:.1f}"
+            tree.insert(
+                "",
+                tk.END,
+                values=(bbox_text, center_text, f"{area:.0f}"),
+            )
 
     def _add_pending_shot(self, payload: Dict[str, Any]) -> None:
         shot_id = str(payload.get("shot_id") or "")

@@ -6,12 +6,13 @@ import queue
 import threading
 import time
 from pathlib import Path
-from typing import Callable, Dict, Optional
+from typing import Any, Callable, Dict, Optional
 
 from ingest.ingester import Ingester
 from metrics.computations import MetricsComputer
 from transport.link_manager import LinkManager
 from transport.rl_manager import RLManager
+from cv.video_pipeline import VideoFramePayload, VideoStreamProcessor
 
 
 logger = logging.getLogger(__name__)
@@ -23,6 +24,7 @@ class ClientAPI:
         self.ingester = Ingester()
         self.metrics = MetricsComputer(on_metrics=self._emit_metrics)
         self.rl_manager = RLManager(config_path=config_path)
+        self.video_stream = VideoStreamProcessor()
 
         self.on_status: Optional[Callable[[Dict[str, object]], None]] = None
         self.on_metrics: Optional[Callable[[Dict[str, object]], None]] = None
@@ -31,6 +33,7 @@ class ClientAPI:
         self.on_stdout: Optional[Callable[[str], None]] = None
         self.on_raw_frame: Optional[Callable[[Dict[str, object]], None]] = None
         self.on_rl_event: Optional[Callable[[Dict[str, object]], None]] = None
+        self.on_video_frame: Optional[Callable[[VideoFramePayload], None]] = None
 
         self.link.on_frame = self._handle_frame
         self.link.on_status = self._handle_status
@@ -39,6 +42,8 @@ class ClientAPI:
         self.ingester.on_stdout = self._handle_stdout
         self.rl_manager.on_event = self._handle_rl_event
         self.rl_manager.send_cmd = self._send_rl_cmd
+        self.video_stream.on_frame = self._handle_video_frame
+        self.video_stream.on_artifact_event = self._handle_artifact_event
 
         self._metrics_lock = threading.Lock()
 
@@ -46,6 +51,7 @@ class ClientAPI:
         self._stdout_queue: "queue.SimpleQueue[str]" = queue.SimpleQueue()
         self._frame_queue: "queue.SimpleQueue[Dict[str, object]]" = queue.SimpleQueue()
         self._rl_queue: "queue.SimpleQueue[Dict[str, object]]" = queue.SimpleQueue()
+        self._video_queue: "queue.SimpleQueue[VideoFramePayload]" = queue.SimpleQueue()
 
         self._latest_tree: Optional[Dict[str, object]] = None
         self._latest_flat: Optional[Dict[str, object]] = None
@@ -107,6 +113,10 @@ class ClientAPI:
 
     # ------------------------------------------------------------------
     def _handle_frame(self, frame: Dict[str, object]) -> None:
+        frame_type = str(frame.get("type", "")).lower()
+        if frame_type == "video_frame":
+            self.video_stream.handle_packet(frame)  # type: ignore[arg-type]
+            return
         with self._metrics_lock:
             self.metrics.update_from_frame(frame)
         self.ingester.handle_frame(frame)
@@ -151,6 +161,16 @@ class ClientAPI:
         else:
             self._rl_queue.put(event)
 
+    def _handle_video_frame(self, frame: VideoFramePayload) -> None:
+        self._video_queue.put(frame)
+
+    def _handle_artifact_event(self, event: Dict[str, Any]) -> None:
+        try:
+            self.ingester.handle_frame(event)
+        except Exception:  # noqa: BLE001
+            logger.exception("Failed to ingest artifact event")
+        self._frame_queue.put(event)
+
     def _emit_metrics(self, metrics: Dict[str, object]) -> None:
         if self.on_metrics:
             self.on_metrics(metrics)
@@ -164,6 +184,7 @@ class ClientAPI:
             self._drain_stdout()
             self._drain_frames()
             self._drain_rl_events()
+            self._drain_video_frames()
 
             if self._flat_pending_metrics and self._latest_flat is not None:
                 with self._metrics_lock:
@@ -230,4 +251,19 @@ class ClientAPI:
             except queue.Empty:
                 break
             self.on_rl_event(event)
+
+    def _drain_video_frames(self) -> None:
+        if not self.on_video_frame:
+            while True:
+                try:
+                    self._video_queue.get_nowait()
+                except queue.Empty:
+                    break
+            return
+        while True:
+            try:
+                frame = self._video_queue.get_nowait()
+            except queue.Empty:
+                break
+            self.on_video_frame(frame)
 

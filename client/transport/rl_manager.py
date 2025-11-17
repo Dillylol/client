@@ -214,6 +214,14 @@ class RLManager:
                     "rpm_manual",
                     "reward",
                     "hit",
+                    "cv_tag_id",
+                    "cv_tag_class",
+                    "cv_x_m",
+                    "cv_y_m",
+                    "cv_z_m",
+                    "cv_yaw",
+                    "cv_pitch",
+                    "cv_roll",
                     "raw",
                 ]
             )
@@ -258,6 +266,14 @@ class RLManager:
             self._coerce_float(ctx.get("manual_target_rpm")),
             reward,
             1 if shot.get("hit") else 0,
+            self._coerce_int(shot.get("cv_tag_id")),
+            shot.get("cv_tag_class"),
+            self._coerce_float(shot.get("cv_x_m")),
+            self._coerce_float(shot.get("cv_y_m")),
+            self._coerce_float(shot.get("cv_z_m")),
+            self._coerce_float(shot.get("cv_yaw")),
+            self._coerce_float(shot.get("cv_pitch")),
+            self._coerce_float(shot.get("cv_roll")),
             json.dumps(shot, ensure_ascii=False, default=str),
         ]
         try:

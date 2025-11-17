@@ -53,6 +53,8 @@ class Ingester:
                 changed_keys = self._store.update_branch("meta.heartbeat", frame, ts_ms)
             elif frame_type in {"stdout", "stderr", "log"}:
                 self._emit_stdout(frame)
+            elif frame_type == "artifact_detections":
+                changed_keys = self._store.update_branch("cv.artifacts.latest", frame, ts_ms)
             else:
                 if self.on_unknown:
                     self.on_unknown(frame)
