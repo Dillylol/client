@@ -1,0 +1,26 @@
+{
+  "delta_bins": [
+    {
+      "d": [
+        32.0,
+        40.0
+      ],
+      "delta": -1969.238806150107,
+      "v": [
+        10.9,
+        11.3
+      ]
+    }
+  ],
+  "gamma": 1.0,
+  "model": "quadratic",
+  "model_version": 1,
+  "note": "seed",
+  "params": {
+    "b0": 1950.0,
+    "b1": 22.0,
+    "b2": 0.45
+  },
+  "schema": "rpm_model/v1",
+  "v_nom": 12.0
+}
